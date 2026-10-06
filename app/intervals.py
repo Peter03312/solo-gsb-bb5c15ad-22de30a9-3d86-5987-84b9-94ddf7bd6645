@@ -50,6 +50,19 @@ def compute_intervals(readings: List[dict], limit: float) -> List[dict]:
     return _compute(readings, lambda r: r["temperature"] > limit)
 
 
+def applicable_policy(
+    sampled_at: str,
+    policies: Sequence[Tuple[str, float]],
+) -> int:
+    """返回 sampled_at 时刻适用策略在（按生效时间升序的）policies 中的下标。
+
+    适用“生效时间不晚于该时刻的最近一条策略”（生效时间相等即生效）；
+    返回 -1 表示该时刻无策略覆盖，调用方应沿用全局默认上限。
+    生效时间与采样时间同为 UTC 固定宽度 ISO 字符串，可直接按字典序比较。
+    """
+    return bisect_right([p[0] for p in policies], sampled_at) - 1
+
+
 def compute_intervals_with_policies(
     readings: List[dict],
     policies: Sequence[Tuple[str, float]],

@@ -1,6 +1,6 @@
 """请求 / 响应数据模型与输入校验。"""
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -340,4 +340,84 @@ class LimitPolicyListResponse(BaseModel):
     limit: float = Field(description="全局默认上限（未被策略覆盖的时间沿用该值）")
     policies: List[LimitPolicyOut] = Field(
         description="该设备全部温度上限策略，按生效时间、策略号排序"
+    )
+
+
+# ---------------------------------------------------------------- 冷链交接温控凭证
+
+class HandoverVoucherIn(BaseModel):
+    """交接温控凭证请求体：交接单号 + 左闭右开的采样时间窗 [start, end)。"""
+
+    handover_no: str = Field(
+        description="设备内唯一交接单号（字母 / 数字 / `.` `_` `-`，≤ 64 字符）",
+        pattern=EVENT_NO_PATTERN,
+    )
+    window_start: datetime = Field(description="采样时间窗起点（含，左闭）")
+    window_end: datetime = Field(description="采样时间窗终点（不含，右开；必须晚于起点）")
+
+    @field_validator("handover_no", mode="before")
+    @classmethod
+    def coerce_handover_no(cls, v):
+        return _coerce_no(v)
+
+    @model_validator(mode="after")
+    def window_end_after_start(self):
+        # 先归一化为带时区的 aware datetime（无时区按 UTC），再比较，
+        # 因此 naive / aware 混用与等价时区表示都能正确判定先后。
+        start = self.window_start
+        end = self.window_end
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if end.astimezone(timezone.utc) <= start.astimezone(timezone.utc):
+            raise ValueError(
+                "window_end must be strictly later than window_start "
+                "(window is half-open [window_start, window_end))"
+            )
+        return self
+
+
+class VoucherReadingOut(BaseModel):
+    """凭证内逐条冻结的读数证据。"""
+
+    event_no: str
+    sampled_at: str = Field(description="生成凭证时读数的采样时间（UTC 归一化）")
+    temperature: float = Field(description="生成凭证时读数的温度（°C）")
+    policy_no: Optional[str] = Field(
+        description="该时刻适用的温度上限策略号；无策略覆盖（沿用全局上限）时为 null"
+    )
+    temp_limit: float = Field(
+        description="该时刻适用的温度上限（策略上限；无策略时为全局上限）"
+    )
+    exceeds_limit: bool = Field(description="温度是否严格大于该时刻适用上限（等于不算）")
+
+
+class HandoverVoucherOut(BaseModel):
+    """冷链交接温控凭证：生成时刻冻结的时间窗、逐条证据与汇总。"""
+
+    device_id: str
+    handover_no: str
+    window_start: str = Field(description="规范化（UTC）后的时间窗起点（含）")
+    window_end: str = Field(description="规范化（UTC）后的时间窗终点（不含）")
+    limit: float = Field(description="生成凭证时的全局默认上限（无策略读数按它判定）")
+    readings: List[VoucherReadingOut] = Field(
+        description="窗内当时未撤销读数，按采样时间、事件号排序逐条冻结"
+    )
+    reading_count: int = Field(description="窗内读数条数（空窗为 0）")
+    exceedance_count: int = Field(description="窗内严格超限条数")
+    max_temperature: Optional[float] = Field(
+        description="窗内最高温度（°C）；空窗为 null"
+    )
+    created_at: str = Field(description="首次生成时间；同单号重试原样返回首次凭证")
+
+
+class HandoverVoucherResponse(BaseModel):
+    voucher: HandoverVoucherOut
+
+
+class HandoverVoucherListResponse(BaseModel):
+    device_id: str
+    vouchers: List[HandoverVoucherOut] = Field(
+        description="该设备全部交接凭证，按生成时间、交接单号排序"
     )

@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from .config import Settings, get_settings
 from .db import connect, init_db
-from .intervals import compute_intervals_with_policies, diff_intervals
+from .intervals import applicable_policy, compute_intervals_with_policies, diff_intervals
 from .models import (
     BatchIn,
     BatchReceiptResponse,
@@ -19,6 +19,9 @@ from .models import (
     DisputeIn,
     DisputeListResponse,
     DisputeResponse,
+    HandoverVoucherIn,
+    HandoverVoucherListResponse,
+    HandoverVoucherResponse,
     IntervalsResponse,
     LimitPolicyIn,
     LimitPolicyListResponse,
@@ -42,7 +45,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="冷链运输温度事件核验服务",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "按设备提交 / 更正 / 撤销温度读数，自动核验并维护超温区间。"
         "连续两次有效读数超过上限即形成超温区间，区间以起点事件号标识。"
@@ -54,6 +57,10 @@ app = FastAPI(
         "支持按采样时间生效的温度上限策略：每条读数适用其采样时间所处"
         "策略的上限，未覆盖时间沿用全局上限；策略写入后在同一事务内"
         "重算区间（含历史读数），同策略号同内容重放幂等。"
+        "冷链交接可按交接单号在指定采样时间窗（左闭右开）内生成温控凭证："
+        "逐条冻结事件号、时间、温度、当时适用的策略号与上限及是否严格超限，"
+        "凭证生成与证据存档同一事务完成，同单号等价时间窗重试原样返回"
+        "首次凭证，异窗冲突；已存凭证不受后续补报 / 更正 / 撤销 / 策略变化影响。"
     ),
     lifespan=lifespan,
 )
@@ -91,14 +98,18 @@ def _load_valid_readings(conn, device_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def _load_policies(conn, device_id: str) -> list[tuple[str, float]]:
-    """读取设备全部温度上限策略，按生效时间升序。"""
+def _load_policies(conn, device_id: str) -> list[tuple[str, float, str]]:
+    """读取设备全部温度上限策略，按生效时间升序。
+
+    返回 (生效时间, 上限, 策略号) 三元组；区间计算只取前两位，
+    凭证冻结时用第三位记录每条读数当时适用的策略号。
+    """
     rows = conn.execute(
-        "SELECT effective_from, temp_limit FROM limit_policies "
+        "SELECT effective_from, temp_limit, policy_no FROM limit_policies "
         "WHERE device_id = ? ORDER BY effective_from, policy_no",
         (device_id,),
     ).fetchall()
-    return [(r["effective_from"], r["temp_limit"]) for r in rows]
+    return [(r["effective_from"], r["temp_limit"], r["policy_no"]) for r in rows]
 
 
 def _current_intervals(conn, device_id: str, default_limit: float) -> list[dict]:
@@ -561,6 +572,199 @@ def list_limit_policies(device_id: str, settings: Settings = Depends(get_setting
     }
 
 
+# ---------------------------------------------------------------- 冷链交接温控凭证
+
+def _build_voucher(conn, device_id: str, handover_no: str,
+                   window_start: str, window_end: str,
+                   default_limit: float, created_at: str) -> dict:
+    """在当前事务内按生成时刻的数据快照冻结凭证内容。
+
+    取时间窗 [window_start, window_end) 内当时未撤销读数，按
+    (采样时间, 事件号) 排序，逐条附上该时刻适用的策略号 / 上限
+    （无策略覆盖时策略号为 None、上限取全局默认）与是否严格超限。
+    只读取、不写入：调用方负责在同一事务内把结果存档。
+    """
+    rows = conn.execute(
+        "SELECT event_no, sampled_at, temperature FROM readings "
+        "WHERE device_id = ? AND revoked = 0 "
+        "AND sampled_at >= ? AND sampled_at < ? "
+        "ORDER BY sampled_at, event_no",
+        (device_id, window_start, window_end),
+    ).fetchall()
+    policies = _load_policies(conn, device_id)
+
+    items: list[dict] = []
+    exceedance_count = 0
+    max_temperature: float | None = None
+    for r in rows:
+        idx = applicable_policy(r["sampled_at"], policies)
+        if idx >= 0:
+            policy_no = policies[idx][2]
+            temp_limit = policies[idx][1]
+        else:
+            policy_no = None
+            temp_limit = default_limit
+        exceeds = r["temperature"] > temp_limit
+        if exceeds:
+            exceedance_count += 1
+        if max_temperature is None or r["temperature"] > max_temperature:
+            max_temperature = r["temperature"]
+        items.append(
+            {
+                "event_no": r["event_no"],
+                "sampled_at": r["sampled_at"],
+                "temperature": r["temperature"],
+                "policy_no": policy_no,
+                "temp_limit": temp_limit,
+                "exceeds_limit": exceeds,
+            }
+        )
+
+    return {
+        "device_id": device_id,
+        "handover_no": handover_no,
+        "window_start": window_start,
+        "window_end": window_end,
+        "limit": default_limit,
+        "readings": items,
+        "reading_count": len(items),
+        "exceedance_count": exceedance_count,
+        # 空窗（窗内无任何有效读数）时最高温度为 null
+        "max_temperature": max_temperature,
+        "created_at": created_at,
+    }
+
+
+def _get_voucher(conn, device_id: str, handover_no: str):
+    return conn.execute(
+        "SELECT * FROM handover_vouchers "
+        "WHERE device_id = ? AND handover_no = ?",
+        (device_id, handover_no),
+    ).fetchone()
+
+
+@app.post(
+    "/devices/{device_id}/handover-vouchers",
+    response_model=HandoverVoucherResponse,
+    status_code=201,
+    summary="生成冷链交接温控凭证（同单号等价时间窗重试返回首次凭证，异窗冲突）",
+)
+def create_handover_voucher(
+    device_id: str,
+    body: HandoverVoucherIn,
+    settings: Settings = Depends(get_settings),
+):
+    # 时间窗端点统一规范化为 UTC 后再存档 / 比较（与采样时间同一口径，
+    # 因此等价时区表示的同一时间窗视为同窗）
+    window_start = to_utc_iso(body.window_start)
+    window_end = to_utc_iso(body.window_end)
+
+    with connect(settings.db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = _get_voucher(conn, device_id, body.handover_no)
+            if existing is not None:
+                same_window = (
+                    existing["window_start"] == window_start
+                    and existing["window_end"] == window_end
+                )
+                if same_window:
+                    # 同设备同单号、等价时区的同一时间窗重试：原样返回首次凭证。
+                    # 凭证在首次生成时已冻结，后续补报 / 更正 / 撤销 / 策略变化
+                    # 都不会改写存档。
+                    voucher = json.loads(existing["voucher"])
+                    conn.commit()
+                    return JSONResponse(status_code=200, content={"voucher": voucher})
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"handover_no '{body.handover_no}' already exists on device "
+                        f"'{device_id}' for window "
+                        f"[{existing['window_start']}, {existing['window_end']}); "
+                        f"requested window [{window_start}, {window_end}) differs"
+                    ),
+                )
+
+            created_at = utc_now_iso()
+            # 按生成时刻的读数 / 策略快照冻结凭证内容
+            voucher = _build_voucher(
+                conn,
+                device_id,
+                body.handover_no,
+                window_start,
+                window_end,
+                settings.temp_limit,
+                created_at,
+            )
+            # 凭证生成与证据存档在同一事务提交：要么都可见，要么都不留痕
+            conn.execute(
+                "INSERT INTO handover_vouchers ("
+                "device_id, handover_no, window_start, window_end, readings, voucher, "
+                "reading_count, exceedance_count, max_temperature, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    device_id,
+                    body.handover_no,
+                    window_start,
+                    window_end,
+                    json.dumps(voucher["readings"], ensure_ascii=False),
+                    json.dumps(voucher, ensure_ascii=False),
+                    voucher["reading_count"],
+                    voucher["exceedance_count"],
+                    voucher["max_temperature"],
+                    created_at,
+                ),
+            )
+            conn.commit()
+        except HTTPException:
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+    return {"voucher": voucher}
+
+
+@app.get(
+    "/devices/{device_id}/handover-vouchers",
+    response_model=HandoverVoucherListResponse,
+    summary="查询设备全部冷链交接凭证（按生成时间、交接单号排序）",
+)
+def list_handover_vouchers(device_id: str, settings: Settings = Depends(get_settings)):
+    with connect(settings.db_path) as conn:
+        rows = conn.execute(
+            "SELECT voucher FROM handover_vouchers "
+            "WHERE device_id = ? ORDER BY created_at, handover_no",
+            (device_id,),
+        ).fetchall()
+    return {
+        "device_id": device_id,
+        "vouchers": [json.loads(r["voucher"]) for r in rows],
+    }
+
+
+@app.get(
+    "/devices/{device_id}/handover-vouchers/{handover_no}",
+    response_model=HandoverVoucherResponse,
+    summary="按交接单号查询温控凭证（未知交接单号报错 404）",
+)
+def get_handover_voucher(
+    device_id: str,
+    handover_no: str,
+    settings: Settings = Depends(get_settings),
+):
+    with connect(settings.db_path) as conn:
+        row = _get_voucher(conn, device_id, handover_no)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"handover voucher '{handover_no}' not found on device '{device_id}'"
+            ),
+        )
+    return {"voucher": json.loads(row["voucher"])}
+
+
 # ---------------------------------------------------------------- 争议工作流
 
 def _get_dispute(conn, device_id: str, dispute_no: str):
@@ -949,7 +1153,7 @@ def health():
 def root(settings: Settings = Depends(get_settings)):
     return {
         "service": "coldchain-temperature-verification",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "temp_limit": settings.temp_limit,
         "docs": "/docs",
     }

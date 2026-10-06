@@ -9,6 +9,10 @@ from contextlib import contextmanager
 # limit_policies 持久化按采样时间生效的温度上限策略：读数适用生效时间不晚于其
 # 采样时间的最近一条策略的上限，未覆盖时间沿用全局上限；同号同内容重放按存档
 # 回执原样返回，同设备同一生效时间只允许一条策略。
+# handover_vouchers 持久化冷链交接温控凭证：按设备 + 交接单号唯一，冻结生成时刻
+# 的时间窗（UTC 归一化）、逐条读数快照（含当时适用的策略号与上限）与汇总信息；
+# 凭证内容与证据存档在同一事务写入，之后读数补报 / 更正 / 撤销 / 策略变化均不
+# 影响已存凭证，同单号重试按时间窗判同后原样返回首次凭证，异窗冲突。
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS readings (
     device_id   TEXT NOT NULL,
@@ -65,6 +69,20 @@ CREATE TABLE IF NOT EXISTS limit_policies (
 -- 同一设备同一生效时间只允许一条策略（应用层先行校验并返回 409，索引兜底）
 CREATE UNIQUE INDEX IF NOT EXISTS ux_limit_policies_effective
     ON limit_policies (device_id, effective_from);
+
+CREATE TABLE IF NOT EXISTS handover_vouchers (
+    device_id   TEXT NOT NULL,
+    handover_no TEXT NOT NULL,    -- 设备内唯一交接单号
+    window_start TEXT NOT NULL,   -- 采样时间窗起点（UTC，左闭，固定宽度可排序）
+    window_end   TEXT NOT NULL,   -- 采样时间窗终点（UTC，右开）
+    readings    TEXT NOT NULL,    -- 逐条冻结证据（JSON：事件号/时间/温度/适用策略号与上限/是否超限）
+    voucher     TEXT NOT NULL,    -- 首次凭证全文（JSON 存档，重试原样返回，后续数据变化不改写）
+    reading_count   INTEGER NOT NULL,  -- 窗内有效读数条数（空窗为 0）
+    exceedance_count INTEGER NOT NULL, -- 严格超限条数
+    max_temperature REAL,              -- 窗内最高温度（空窗为 NULL）
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (device_id, handover_no)
+);
 """
 
 # 旧版本库（无 revision 列）的一次性迁移；默认值 1 即历史读数的初始修订号。

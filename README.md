@@ -18,6 +18,13 @@
 （含历史读数，回溯生效时间立即生效），同策略号同内容重放幂等、异内容冲突，
 同设备同一生效时间只允许一条策略。
 
+并支持**冷链交接温控凭证**：交接时按设备号、交接单号与起止时间（时间窗
+左闭右开）生成凭证，服务按当时未撤销读数逐条冻结事件号、采样时间、温度、
+该时刻适用的策略号与上限（无策略时用全局上限）及是否严格超限，并汇总读数数、
+超限数与最高温度（空窗为 `null`）；凭证生成与证据存档在**同一事务**完成，
+同设备同单号、等价时区表示的同一时间窗重试原样返回首次凭证，异窗冲突；
+凭证一经存档，后续补报、更正、撤销或策略变化都不再改动它。
+
 ## 超温区间判定规则
 
 - 同一设备的**有效**（未撤销）读数按 **(采样时间, 事件号)** 升序排列；
@@ -89,6 +96,9 @@ Compose 中通过 `environment` 修改，例如 `TEMP_LIMIT: "2.0"`。
 | GET    | `/devices/{device_id}/disputes/{dispute_no}` | 查询单个争议（未知争议号 404）        |
 | POST   | `/devices/{device_id}/limit-policies`   | 提交温度上限策略（同号同内容幂等，异内容 409） |
 | GET    | `/devices/{device_id}/limit-policies`   | 查询设备全部温度上限策略（按生效时间排序）   |
+| POST   | `/devices/{device_id}/handover-vouchers` | 生成 / 重放冷链交接温控凭证（同窗幂等，异窗 409） |
+| GET    | `/devices/{device_id}/handover-vouchers` | 查询设备全部交接凭证（按生成时间排序）       |
+| GET    | `/devices/{device_id}/handover-vouchers/{handover_no}` | 按交接单号查询凭证（未知单号 404） |
 | GET    | `/health`                               | 健康检查                                   |
 
 ### 请求字段
@@ -420,6 +430,9 @@ curl $BASE/disputes/D1              # 单个争议（含冻结依据、终态、
   与区间规则，不改变单条读数 / 争议接口的行为；
 - 新增策略表 `limit_policies` 与既有各表相互独立；未配置任何策略时，所有接口的
   区间判定与之前完全一致（统一使用全局 `TEMP_LIMIT`）；
+- 新增凭证表 `handover_vouchers` 只在凭证接口写入，且仅插入新行、从不更新 / 删除；
+  凭证生成不改动任何读数 / 区间 / 策略 / 批次 / 争议数据，既有接口的请求、响应与
+  幂等语义完全不变；已存凭证为生成时刻快照，后续任何数据变化都不会改写它；
 - 升级旧版本数据库时自动幂等迁移：旧读数补列 `revision = 1`，新表自动创建，
   无需手工脚本，现有 `uvicorn app.main:app` 启动方式保持可用。
 
@@ -523,15 +536,150 @@ curl -X POST $BASE/readings -H 'Content-Type: application/json' \
 curl $BASE/limit-policies
 ```
 
+## 冷链交接温控凭证
+
+### 规则
+
+- 交接时提交 **设备号 + 交接单号 + 起止时间**，采样时间窗为 **左闭右开**
+  `[window_start, window_end)`（含起点、不含终点）；
+- 凭证冻结窗内**当时未撤销**读数，按 **(采样时间, 事件号)** 升序逐条记录：
+  - `event_no` / `sampled_at` / `temperature`：生成凭证时读数的事件号、时间、温度；
+  - `policy_no`：该时刻适用的策略号；**无策略覆盖时为 `null`**；
+  - `temp_limit`：该时刻适用的上限（策略上限；无策略时为全局 `TEMP_LIMIT`）；
+  - `exceeds_limit`：温度是否**严格大于**该时刻适用上限（等于不算超限）；
+- 同时汇总 `reading_count`（读数数）、`exceedance_count`（超限数）、
+  `max_temperature`（窗内最高温度，**空窗为 `null`**）；
+- **凭证生成与证据存档在同一事务完成**：要么同时可见，要么都不留痕；
+- **同设备同单号 + 等价时区表示的同一时间窗**重试：`200` 并**原样返回首次凭证**；
+  **同单号 + 异窗**（起点或终点时刻不同）：`409`；
+- 凭证只反映**生成时刻**的数据快照：之后的读数补报、更正、撤销、争议批准
+  或策略新增 / 变化**都不会改动已存凭证**；需要按当前数据出证请使用**新交接单号**；
+- 起止时间非法或结束不晚于开始（`window_end <= window_start`）→ `422`；
+  **空窗（窗内无有效读数）允许生成**，此时读数列表为空、最高温度为 `null`；
+  设备是否曾上报读数不影响出证。
+- 交接单号按设备隔离，不同设备可复用同一交接单号。
+
+### 生成凭证 `POST /devices/{device_id}/handover-vouchers`
+
+请求体：
+
+```json
+{
+  "handover_no": "HO-20261001-001",
+  "window_start": "2026-10-01T08:00:00Z",
+  "window_end":   "2026-10-01T09:00:00Z"
+}
+```
+
+- `handover_no`：设备内唯一交接单号（规则同事件号，字母 / 数字开头，≤ 64 字符）；
+- `window_start` / `window_end`：ISO 8601 时间（无时区按 UTC 处理），
+  终点必须**严格晚于**起点。
+
+响应（首次成功 `201 Created`，同窗重放 `200 OK`）：
+
+```json
+{
+  "voucher": {
+    "device_id": "truck-001",
+    "handover_no": "HO-20261001-001",
+    "window_start": "2026-10-01T08:00:00.000000Z",
+    "window_end":   "2026-10-01T09:00:00.000000Z",
+    "limit": 8.0,
+    "readings": [
+      {"event_no": "E1", "sampled_at": "2026-10-01T08:00:00.000000Z",
+       "temperature": 9.0, "policy_no": null, "temp_limit": 8.0,
+       "exceeds_limit": true},
+      {"event_no": "E2", "sampled_at": "2026-10-01T08:10:00.000000Z",
+       "temperature": 7.0, "policy_no": "P1", "temp_limit": 5.0,
+       "exceeds_limit": true}
+    ],
+    "reading_count": 2,
+    "exceedance_count": 2,
+    "max_temperature": 9.0,
+    "created_at": "2026-10-06T03:10:00.123456Z"
+  }
+}
+```
+
+空窗凭证：`readings` 为 `[]`、`reading_count = 0`、`exceedance_count = 0`、
+`max_temperature = null`。
+
+### 查询凭证
+
+- `GET /devices/{device_id}/handover-vouchers/{handover_no}`
+  → `{"voucher": {...}}`，未知交接单号 `404`；
+- `GET /devices/{device_id}/handover-vouchers`
+  → `{"device_id", "vouchers":[...]}`，按生成时间、交接单号排序。
+
+### 凭证接口示例
+
+```bash
+BASE=http://localhost:8000/devices/truck-001
+
+# 0. 准备数据（也可已有读数 / 策略）：E1、E2 处于交接时间窗内
+curl -X POST $BASE/readings -H 'Content-Type: application/json' \
+  -d '{"event_no":"E1","sampled_at":"2026-10-01T08:00:00Z","temperature":9.0}'
+curl -X POST $BASE/readings -H 'Content-Type: application/json' \
+  -d '{"event_no":"E2","sampled_at":"2026-10-01T08:10:00Z","temperature":7.0}'
+# 08:05 起策略上限 5.0：E1 用全局上限 8.0，E2 用策略上限 5.0
+curl -X POST $BASE/limit-policies -H 'Content-Type: application/json' \
+  -d '{"policy_no":"P1","effective_from":"2026-10-01T08:05:00Z","temp_limit":5.0}'
+
+# 1. 交接出证：时间窗 [08:00, 09:00)，左闭右开；首次 201
+curl -X POST $BASE/handover-vouchers -H 'Content-Type: application/json' -d '{
+  "handover_no":"HO-001",
+  "window_start":"2026-10-01T08:00:00Z",
+  "window_end":"2026-10-01T09:00:00Z"}'
+
+# 2. 等价时区表示的同一时间窗重试 → 200，返回与首次完全一致的凭证
+curl -X POST $BASE/handover-vouchers -H 'Content-Type: application/json' -d '{
+  "handover_no":"HO-001",
+  "window_start":"2026-10-01T16:00:00+08:00",
+  "window_end":"2026-10-01T17:00:00+08:00"}'
+
+# 3. 同单号异窗（终点不同）→ 409
+curl -X POST $BASE/handover-vouchers -H 'Content-Type: application/json' -d '{
+  "handover_no":"HO-001",
+  "window_start":"2026-10-01T08:00:00Z",
+  "window_end":"2026-10-01T08:30:00Z"}'
+
+# 4. 出证后数据变化（补报 / 更正 / 撤销 / 新策略）不影响已存凭证：
+#    按单号查询仍返回首次凭证；需要当前证据请用新单号
+curl -X PUT    $BASE/readings/E2 -H 'Content-Type: application/json' \
+  -d '{"sampled_at":"2026-10-01T08:10:00Z","temperature":1.0}'
+curl -X DELETE $BASE/readings/E1
+curl $BASE/handover-vouchers/HO-001     # 仍为首次冻结内容
+curl -X POST $BASE/handover-vouchers -H 'Content-Type: application/json' -d '{
+  "handover_no":"HO-002",
+  "window_start":"2026-10-01T08:00:00Z",
+  "window_end":"2026-10-01T09:00:00Z"}'
+
+# 5. 空窗也可出证（readings=[]、max_temperature=null）
+curl -X POST $BASE/handover-vouchers -H 'Content-Type: application/json' -d '{
+  "handover_no":"HO-EMPTY",
+  "window_start":"2026-10-02T00:00:00Z",
+  "window_end":"2026-10-02T01:00:00Z"}'
+
+# 6. 非法时间窗 → 422（结束不晚于开始同样拒绝）
+curl -X POST $BASE/handover-vouchers -H 'Content-Type: application/json' -d '{
+  "handover_no":"HO-BAD",
+  "window_start":"2026-10-01T09:00:00Z",
+  "window_end":"2026-10-01T09:00:00Z"}'
+
+# 7. 查询
+curl $BASE/handover-vouchers             # 全部凭证（按生成时间排序）
+curl $BASE/handover-vouchers/HO-001      # 按交接单号查询（未知单号 404）
+```
+
 ## 错误码
 
 | 状态码 | 场景                                                                 |
 | ------ | -------------------------------------------------------------------- |
-| 200    | 成功（含幂等重放、重复撤销、争议同内容重放 / 终态同决定重试、批次同内容重试、策略同号同内容重放） |
-| 201    | 争议首次申请成功；批次首次提交成功；策略首次写入成功                 |
-| 404    | 更正 / 撤销的事件号不存在；争议目标读数不存在；查询 / 决定未知争议号；向未知设备（无任何读数）提交策略 |
-| 409    | 同事件号提交不同内容；更正已撤销读数；争议目标已撤销；同争议号异内容；对终态争议发反向决定；同批次号异内容；批次中任一读数与库中同号异内容（整批拒绝）；同策略号异内容；同设备同一生效时间的策略重复 |
-| 422    | 无效时间格式、无效温度（非数值 / 无穷 / 超范围）、非法事件号；争议原因缺失 / 空白；`correct` 缺目标值或 `revoke` 带目标值；批内事件号重复、批次读数列表为空、非法批次号；非法策略号 / 生效时间 / 策略阈值 |
+| 200    | 成功（含幂等重放、重复撤销、争议同内容重放 / 终态同决定重试、批次同内容重试、策略同号同内容重放、交接凭证同窗重试 / 查询） |
+| 201    | 争议首次申请成功；批次首次提交成功；策略首次写入成功；交接凭证首次生成成功 |
+| 404    | 更正 / 撤销的事件号不存在；争议目标读数不存在；查询 / 决定未知争议号；向未知设备（无任何读数）提交策略；查询未知交接单号 |
+| 409    | 同事件号提交不同内容；更正已撤销读数；争议目标已撤销；同争议号异内容；对终态争议发反向决定；同批次号异内容；批次中任一读数与库中同号异内容（整批拒绝）；同策略号异内容；同设备同一生效时间的策略重复；同交接单号请求不同时间窗 |
+| 422    | 无效时间格式、无效温度（非数值 / 无穷 / 超范围）、非法事件号；争议原因缺失 / 空白；`correct` 缺目标值或 `revoke` 带目标值；批内事件号重复、批次读数列表为空、非法批次号；非法策略号 / 生效时间 / 策略阈值；非法交接单号 / 时间格式、时间窗结束不晚于开始 |
 
 错误响应体均含 `detail` 字段说明原因。
 
@@ -546,16 +694,17 @@ pytest -q
 
 ```
 app/
-  main.py       # FastAPI 路由、事务内重算区间、批次提交、争议工作流、温度上限策略、错误处理
-  intervals.py  # 区间计算（单上限 / 按策略逐读数上限）与差异比对（纯函数）
-  models.py     # 请求/响应模型与输入校验（含批次、争议申请 / 决定、策略模型）
-  db.py         # SQLite 连接、建表（读数 / 争议 / 批次 / 策略）与旧库 revision 增量迁移
+  main.py       # FastAPI 路由、事务内重算区间、批次提交、争议工作流、温度上限策略、交接温控凭证、错误处理
+  intervals.py  # 区间计算（单上限 / 按策略逐读数上限）、适用策略查找与差异比对（纯函数）
+  models.py     # 请求/响应模型与输入校验（含批次、争议、策略、交接凭证模型）
+  db.py         # SQLite 连接、建表（读数 / 争议 / 批次 / 策略 / 交接凭证）与旧库 revision 增量迁移
   config.py     # 环境变量配置
   util.py       # 时间规范化（UTC、固定宽度，保证可排序）
 tests/
-  test_api.py       # 原读数 / 区间接口测试（语义不变）
-  test_batches.py   # 离线网关成批上报测试（整批事务、逐条状态、一次性差异、重试回执）
-  test_disputes.py  # 争议工作流测试（冻结、批准 / 驳回、过期、幂等、迁移）
-  test_policies.py  # 温度上限策略测试（回溯重算、多策略时序、幂等、冲突、错误、隔离）
+  test_api.py              # 原读数 / 区间接口测试（语义不变）
+  test_batches.py          # 离线网关成批上报测试（整批事务、逐条状态、一次性差异、重试回执）
+  test_disputes.py         # 争议工作流测试（冻结、批准 / 驳回、过期、幂等、迁移）
+  test_policies.py         # 温度上限策略测试（回溯重算、多策略时序、幂等、冲突、错误、隔离）
+  test_handover_vouchers.py # 交接温控凭证测试（窗口边界、逐条冻结、汇总、幂等 / 冲突、出证后不变性、校验、查询、隔离）
 Dockerfile / docker-compose.yml / requirements*.txt
 ```
