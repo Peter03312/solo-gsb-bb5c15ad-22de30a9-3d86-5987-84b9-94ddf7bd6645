@@ -11,9 +11,13 @@
 按采样时间生效的温度上限策略：每条读数适用其采样时间所处策略的上限
 （生效时间不晚于该读数采样时间的最近一条策略），无策略覆盖的读数
 沿用全局默认上限。
+
+冷链交接凭证：在指定左闭右开 [window_start, window_end) 采样时间窗内，
+按当时未撤销读数的 (采样时间, 事件号) 升序逐条冻结证据，每条记录该时刻
+适用的策略号与上限（无策略覆盖时策略号为空、用全局上限）及是否严格超限。
 """
 from bisect import bisect_right
-from typing import Callable, Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 
 def _compute(readings: List[dict], exceeds: Callable[[dict], bool]) -> List[dict]:
@@ -92,3 +96,74 @@ def diff_intervals(before: List[dict], after: List[dict]) -> Dict[str, List[dict
         if before_by_key[k] != after_by_key[k]
     ]
     return {"added": added, "changed": changed, "invalidated": invalidated}
+
+
+def applicable_policy(
+    sampled_at: str,
+    effective_times: Sequence[str],
+    policies: Sequence[Tuple[str, str, float]],
+    default_limit: float,
+) -> Tuple[Optional[str], float]:
+    """返回读数采样时刻适用的 (策略号, 上限)。
+
+    policies 为 (生效时间, 策略号, 上限) 列表，按生效时间升序；
+    effective_times 为其生效时间列（调用方预取，避免逐条重复构造）。
+    适用生效时间不晚于采样时间的最近一条策略（生效时间等于采样时间即生效）；
+    此前无策略覆盖时策略号为 None、沿用全局默认上限。
+    """
+    idx = bisect_right(effective_times, sampled_at) - 1
+    if idx < 0:
+        return None, default_limit
+    return policies[idx][1], policies[idx][2]
+
+
+def build_credential_evidence(
+    readings: List[dict],
+    policies: Sequence[Tuple[str, str, float]],
+    default_limit: float,
+    window_start: str,
+    window_end: str,
+) -> Dict[str, object]:
+    """冻结左闭右开时间窗 [window_start, window_end) 内的逐条温控凭证。
+
+    调用方需保证读数均为当时未撤销读数（撤销读数不得进入凭证）；
+    时间窗过滤与 (采样时间, 事件号) 排序在此完成。
+    返回逐条证据、读数数、超限数与窗内最高温度（空窗为 None）。
+    """
+    window = [
+        r
+        for r in readings
+        if window_start <= r["sampled_at"] < window_end
+    ]
+    window.sort(key=lambda r: (r["sampled_at"], r["event_no"]))
+    effective_times = [p[0] for p in policies]
+
+    entries: List[dict] = []
+    exceed_count = 0
+    max_temperature: Optional[float] = None
+    for r in window:
+        policy_no, limit = applicable_policy(
+            r["sampled_at"], effective_times, policies, default_limit
+        )
+        exceeds = r["temperature"] > limit  # 严格超限：等于上限不算
+        if exceeds:
+            exceed_count += 1
+        if max_temperature is None or r["temperature"] > max_temperature:
+            max_temperature = r["temperature"]
+        entries.append(
+            {
+                "event_no": r["event_no"],
+                "sampled_at": r["sampled_at"],
+                "temperature": r["temperature"],
+                "policy_no": policy_no,
+                "limit": limit,
+                "exceeds_limit": exceeds,
+            }
+        )
+
+    return {
+        "entries": entries,
+        "reading_count": len(entries),
+        "exceed_count": exceed_count,
+        "max_temperature": max_temperature,
+    }

@@ -10,7 +10,11 @@ from fastapi.responses import JSONResponse
 
 from .config import Settings, get_settings
 from .db import connect, init_db
-from .intervals import compute_intervals_with_policies, diff_intervals
+from .intervals import (
+    build_credential_evidence,
+    compute_intervals_with_policies,
+    diff_intervals,
+)
 from .models import (
     BatchIn,
     BatchReceiptResponse,
@@ -19,6 +23,8 @@ from .models import (
     DisputeIn,
     DisputeListResponse,
     DisputeResponse,
+    HandoverCredentialIn,
+    HandoverCredentialResponse,
     IntervalsResponse,
     LimitPolicyIn,
     LimitPolicyListResponse,
@@ -42,7 +48,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="冷链运输温度事件核验服务",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "按设备提交 / 更正 / 撤销温度读数，自动核验并维护超温区间。"
         "连续两次有效读数超过上限即形成超温区间，区间以起点事件号标识。"
@@ -54,6 +60,10 @@ app = FastAPI(
         "支持按采样时间生效的温度上限策略：每条读数适用其采样时间所处"
         "策略的上限，未覆盖时间沿用全局上限；策略写入后在同一事务内"
         "重算区间（含历史读数），同策略号同内容重放幂等。"
+        "支持冷链交接温控凭证：在指定左闭右开采样时间窗内逐条冻结当时"
+        "未撤销读数的证据（事件号、时间、温度、适用策略号与上限、是否"
+        "严格超限），凭证与证据在同一事务存档，同设备同单号等窗重试"
+        "原样返回首次凭证，异窗冲突；存档后不受读数与策略后续变化影响。"
     ),
     lifespan=lifespan,
 )
@@ -99,6 +109,16 @@ def _load_policies(conn, device_id: str) -> list[tuple[str, float]]:
         (device_id,),
     ).fetchall()
     return [(r["effective_from"], r["temp_limit"]) for r in rows]
+
+
+def _load_policies_with_no(conn, device_id: str) -> list[tuple[str, str, float]]:
+    """读取设备全部温度上限策略 (生效时间, 策略号, 上限)，按生效时间升序。"""
+    rows = conn.execute(
+        "SELECT effective_from, policy_no, temp_limit FROM limit_policies "
+        "WHERE device_id = ? ORDER BY effective_from, policy_no",
+        (device_id,),
+    ).fetchall()
+    return [(r["effective_from"], r["policy_no"], r["temp_limit"]) for r in rows]
 
 
 def _current_intervals(conn, device_id: str, default_limit: float) -> list[dict]:
@@ -561,6 +581,134 @@ def list_limit_policies(device_id: str, settings: Settings = Depends(get_setting
     }
 
 
+# ---------------------------------------------------------------- 冷链交接温控凭证
+
+def _get_credential(conn, device_id: str, handover_no: str):
+    return conn.execute(
+        "SELECT * FROM handover_credentials "
+        "WHERE device_id = ? AND handover_no = ?",
+        (device_id, handover_no),
+    ).fetchone()
+
+
+@app.post(
+    "/devices/{device_id}/handover-credentials",
+    response_model=HandoverCredentialResponse,
+    status_code=201,
+    summary="生成冷链交接温控凭证（凭证与证据同事务存档；同单号等窗重试原样返回）",
+)
+def create_handover_credential(
+    device_id: str,
+    body: HandoverCredentialIn,
+    settings: Settings = Depends(get_settings),
+):
+    # 时间窗统一规范化为 UTC 后再比较 / 存档（与读数采样时间同一排序键）
+    window_start = to_utc_iso(body.window_start)
+    window_end = to_utc_iso(body.window_end)
+
+    with connect(settings.db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = _get_credential(conn, device_id, body.handover_no)
+            if existing is not None:
+                same_window = (
+                    existing["window_start"] == window_start
+                    and existing["window_end"] == window_end
+                )
+                if same_window:
+                    # 同设备同单号、等价时区表示的同一时间窗：原样返回首次凭证，
+                    # 不重读数据、不重新生成（即使读数 / 策略随后发生任何变化）
+                    credential = json.loads(existing["evidence"])
+                    conn.commit()
+                    return JSONResponse(
+                        status_code=200, content={"credential": credential}
+                    )
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"handover_no '{body.handover_no}' on device '{device_id}' "
+                        f"already has a frozen credential for window "
+                        f"[{existing['window_start']}, {existing['window_end']}); "
+                        f"a different window cannot replace it"
+                    ),
+                )
+
+            # 快照窗内“当时未撤销”读数与当前策略：撤销读数、窗外读数均不纳入
+            rows = conn.execute(
+                "SELECT event_no, sampled_at, temperature FROM readings "
+                "WHERE device_id = ? AND revoked = 0 "
+                "AND sampled_at >= ? AND sampled_at < ? "
+                "ORDER BY sampled_at, event_no",
+                (device_id, window_start, window_end),
+            ).fetchall()
+            evidence = build_credential_evidence(
+                [dict(r) for r in rows],
+                _load_policies_with_no(conn, device_id),
+                settings.temp_limit,
+                window_start,
+                window_end,
+            )
+            now = utc_now_iso()
+            credential = {
+                "device_id": device_id,
+                "handover_no": body.handover_no,
+                "window_start": window_start,
+                "window_end": window_end,
+                "limit": settings.temp_limit,
+                "entries": evidence["entries"],
+                "reading_count": evidence["reading_count"],
+                "exceed_count": evidence["exceed_count"],
+                "max_temperature": evidence["max_temperature"],
+                "created_at": now,
+            }
+            # 凭证生成与证据存档在同一事务完成
+            conn.execute(
+                "INSERT INTO handover_credentials "
+                "(device_id, handover_no, window_start, window_end, evidence, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    device_id,
+                    body.handover_no,
+                    window_start,
+                    window_end,
+                    json.dumps(credential, ensure_ascii=False),
+                    now,
+                ),
+            )
+            conn.commit()
+        except HTTPException:
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+    return {"credential": credential}
+
+
+@app.get(
+    "/devices/{device_id}/handover-credentials/{handover_no}",
+    response_model=HandoverCredentialResponse,
+    summary="按交接单号查询已冻结的温控凭证（未知交接单号 404）",
+)
+def get_handover_credential(
+    device_id: str,
+    handover_no: str,
+    settings: Settings = Depends(get_settings),
+):
+    with connect(settings.db_path) as conn:
+        row = _get_credential(conn, device_id, handover_no)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"handover credential '{handover_no}' not found on device "
+                f"'{device_id}'"
+            ),
+        )
+    # 已存凭证原样返回存档快照，不受读数补报 / 更正 / 撤销 / 策略变化影响
+    return {"credential": json.loads(row["evidence"])}
+
+
 # ---------------------------------------------------------------- 争议工作流
 
 def _get_dispute(conn, device_id: str, dispute_no: str):
@@ -949,7 +1097,7 @@ def health():
 def root(settings: Settings = Depends(get_settings)):
     return {
         "service": "coldchain-temperature-verification",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "temp_limit": settings.temp_limit,
         "docs": "/docs",
     }

@@ -18,6 +18,14 @@
 （含历史读数，回溯生效时间立即生效），同策略号同内容重放幂等、异内容冲突，
 同设备同一生效时间只允许一条策略。
 
+冷链交接时还可生成**温控凭证**：给定设备号、交接单号与左闭右开的采样时间窗，
+服务按当时未撤销读数的采样时间、事件号排序，逐条冻结事件号、采样时间、温度、
+该时刻适用的策略号与上限（无策略时为全局上限）及是否严格超限，并汇总读数数、
+超限数与最高温度（空窗为 `null`）。凭证生成与证据存档在**同一事务**完成；
+同设备同单号、等价时区表示的同一时间窗重试原样返回首次凭证，异窗冲突；
+凭证一经存档，后续读数补报 / 更正 / 撤销或策略变化均**不改动**已存凭证，
+新单号按当前数据生成，可按交接单号查询凭证。
+
 ## 超温区间判定规则
 
 - 同一设备的**有效**（未撤销）读数按 **(采样时间, 事件号)** 升序排列；
@@ -89,6 +97,8 @@ Compose 中通过 `environment` 修改，例如 `TEMP_LIMIT: "2.0"`。
 | GET    | `/devices/{device_id}/disputes/{dispute_no}` | 查询单个争议（未知争议号 404）        |
 | POST   | `/devices/{device_id}/limit-policies`   | 提交温度上限策略（同号同内容幂等，异内容 409） |
 | GET    | `/devices/{device_id}/limit-policies`   | 查询设备全部温度上限策略（按生效时间排序）   |
+| POST   | `/devices/{device_id}/handover-credentials` | 生成冷链交接温控凭证（等窗重试原样返回，异窗 409） |
+| GET    | `/devices/{device_id}/handover-credentials/{handover_no}` | 按交接单号查询已冻结凭证（未知单号 404） |
 | GET    | `/health`                               | 健康检查                                   |
 
 ### 请求字段
@@ -420,6 +430,8 @@ curl $BASE/disputes/D1              # 单个争议（含冻结依据、终态、
   与区间规则，不改变单条读数 / 争议接口的行为；
 - 新增策略表 `limit_policies` 与既有各表相互独立；未配置任何策略时，所有接口的
   区间判定与之前完全一致（统一使用全局 `TEMP_LIMIT`）；
+- 新增凭证表 `handover_credentials` 与既有各表相互独立：凭证只在生成当时
+  快照读数与策略，不改变读数 / 批次 / 争议 / 策略接口的任何行为；
 - 升级旧版本数据库时自动幂等迁移：旧读数补列 `revision = 1`，新表自动创建，
   无需手工脚本，现有 `uvicorn app.main:app` 启动方式保持可用。
 
@@ -523,15 +535,132 @@ curl -X POST $BASE/readings -H 'Content-Type: application/json' \
 curl $BASE/limit-policies
 ```
 
+## 冷链交接温控凭证
+
+冷链交接时，可按设备为一次交接留存指定采样时间窗内的**温控凭证**。凭证是
+生成时点的**冻结快照**：只纳入窗内**当时未撤销**的读数，随后任何补报、更正、
+撤销或策略变化都不会改动已存凭证。
+
+### 规则
+
+- 请求含**设备号**（路径）、**交接单号**与**起止时间**；采样时间窗为
+  **左闭右开** `[window_start, window_end)`，按读数采样时间过滤；
+- 窗内读数按 **(采样时间, 事件号)** 升序，逐条冻结：
+  - `event_no` / `sampled_at` / `temperature`；
+  - `policy_no` / `limit`：该读数采样时刻适用的策略号与上限
+    （生效时间不晚于采样时间的最近一条策略；**无策略覆盖时 `policy_no` 为
+    `null`、`limit` 为全局上限**，生效时间等于采样时间即生效）；
+  - `exceeds_limit`：温度是否**严格大于**适用上限（等于上限不算）；
+- 汇总 `reading_count`（读数数）、`exceed_count`（严格超限数）、
+  `max_temperature`（窗内最高温度，**空窗为 `null`**）；
+- **凭证生成与证据存档在同一事务完成**（要么同时可见，要么都不存在）；
+- **同设备同单号 + 同一时间窗**（UTC 归一化后相同，**等价时区表示也算同窗**）
+  重试：返回 `200` 与**首次凭证**（含首次 `created_at`），不重读、不重算；
+- **同设备同单号 + 不同时间窗**：`409 Conflict`，首次凭证保持不变；
+- 凭证存档后读数的**补报 / 更正 / 撤销**或**策略变化**均不影响已存凭证；
+  **新交接单号**按当前数据重新生成；
+- `window_start` / `window_end` 非法，或 `window_end <= window_start`
+  （归一化后比较）：`422`；**空窗可以生成**（设备从未上报读数也可）；
+- 交接单号按设备隔离，不同设备可复用同一交接单号。
+
+### 生成凭证 `POST /devices/{device_id}/handover-credentials`
+
+```json
+{
+  "handover_no": "HO-20261006-01",
+  "window_start": "2026-10-01T08:00:00Z",
+  "window_end": "2026-10-01T09:00:00Z"
+}
+```
+
+- `handover_no`：设备内唯一交接单号（规则同事件号，字母 / 数字开头，≤ 64 字符）。
+
+### 响应（首次成功 `201 Created`）
+
+```json
+{
+  "credential": {
+    "device_id": "truck-001",
+    "handover_no": "HO-20261006-01",
+    "window_start": "2026-10-01T08:00:00.000000Z",
+    "window_end": "2026-10-01T09:00:00.000000Z",
+    "limit": 8.0,
+    "entries": [
+      {"event_no": "E1", "sampled_at": "2026-10-01T08:00:00.000000Z",
+       "temperature": 9.0, "policy_no": null, "limit": 8.0, "exceeds_limit": true},
+      {"event_no": "E2", "sampled_at": "2026-10-01T08:10:00.000000Z",
+       "temperature": 6.0, "policy_no": "P1", "limit": 5.0, "exceeds_limit": true}
+    ],
+    "reading_count": 2,
+    "exceed_count": 2,
+    "max_temperature": 9.0,
+    "created_at": "2026-10-06T03:10:22.418801Z"
+  }
+}
+```
+
+### 查询凭证 `GET /devices/{device_id}/handover-credentials/{handover_no}`
+
+返回 `{"credential": {...}}`，内容与首次凭证完全一致；未知交接单号 `404`。
+
+### 凭证接口示例
+
+```bash
+BASE=http://localhost:8000/devices/truck-001
+
+# 1. 提交读数与一条 08:00 起生效的策略（上限 5.0）
+curl -X POST $BASE/readings -H 'Content-Type: application/json' \
+  -d '{"event_no":"E1","sampled_at":"2026-10-01T08:00:00Z","temperature":9.0}'
+curl -X POST $BASE/readings -H 'Content-Type: application/json' \
+  -d '{"event_no":"E2","sampled_at":"2026-10-01T08:10:00Z","temperature":6.0}'
+curl -X POST $BASE/limit-policies -H 'Content-Type: application/json' \
+  -d '{"policy_no":"P1","effective_from":"2026-10-01T08:00:00Z","temp_limit":5.0}'
+
+# 2. 生成交接凭证：左闭右开时间窗，逐条冻结策略号 / 上限 / 严格超限
+curl -X POST $BASE/handover-credentials -H 'Content-Type: application/json' -d '{
+  "handover_no":"HO-001",
+  "window_start":"2026-10-01T08:00:00Z",
+  "window_end":"2026-10-01T09:00:00Z"}'
+
+# 3. 等价时区重试同一时间窗 → 200，返回与首次完全一致的凭证
+curl -X POST $BASE/handover-credentials -H 'Content-Type: application/json' -d '{
+  "handover_no":"HO-001",
+  "window_start":"2026-10-01T16:00:00+08:00",
+  "window_end":"2026-10-01T17:00:00+08:00"}'
+
+# 4. 同单号异窗 → 409（首次凭证不变）
+curl -X POST $BASE/handover-credentials -H 'Content-Type: application/json' -d '{
+  "handover_no":"HO-001",
+  "window_start":"2026-10-01T08:00:00Z",
+  "window_end":"2026-10-01T08:30:00Z"}'
+
+# 5. 凭证存档后的补报 / 更正 / 撤销 / 策略变化都不改动 HO-001；
+#    新单号 HO-002 按当前数据重新生成
+curl -X DELETE $BASE/readings/E2
+curl -X POST $BASE/handover-credentials -H 'Content-Type: application/json' -d '{
+  "handover_no":"HO-002",
+  "window_start":"2026-10-01T08:00:00Z",
+  "window_end":"2026-10-01T09:00:00Z"}'
+
+# 6. 空窗可生成：reading_count=0、exceed_count=0、max_temperature=null
+curl -X POST $BASE/handover-credentials -H 'Content-Type: application/json' -d '{
+  "handover_no":"HO-EMPTY",
+  "window_start":"2026-10-03T00:00:00Z",
+  "window_end":"2026-10-03T01:00:00Z"}'
+
+# 7. 起止非法 / 结束不晚于开始 → 422；按单号查询（未知单号 404）
+curl $BASE/handover-credentials/HO-001
+```
+
 ## 错误码
 
 | 状态码 | 场景                                                                 |
 | ------ | -------------------------------------------------------------------- |
-| 200    | 成功（含幂等重放、重复撤销、争议同内容重放 / 终态同决定重试、批次同内容重试、策略同号同内容重放） |
-| 201    | 争议首次申请成功；批次首次提交成功；策略首次写入成功                 |
-| 404    | 更正 / 撤销的事件号不存在；争议目标读数不存在；查询 / 决定未知争议号；向未知设备（无任何读数）提交策略 |
-| 409    | 同事件号提交不同内容；更正已撤销读数；争议目标已撤销；同争议号异内容；对终态争议发反向决定；同批次号异内容；批次中任一读数与库中同号异内容（整批拒绝）；同策略号异内容；同设备同一生效时间的策略重复 |
-| 422    | 无效时间格式、无效温度（非数值 / 无穷 / 超范围）、非法事件号；争议原因缺失 / 空白；`correct` 缺目标值或 `revoke` 带目标值；批内事件号重复、批次读数列表为空、非法批次号；非法策略号 / 生效时间 / 策略阈值 |
+| 200    | 成功（含幂等重放、重复撤销、争议同内容重放 / 终态同决定重试、批次同内容重试、策略同号同内容重放、交接凭证同窗重试 / 查询） |
+| 201    | 争议首次申请成功；批次首次提交成功；策略首次写入成功；交接凭证首次生成成功 |
+| 404    | 更正 / 撤销的事件号不存在；争议目标读数不存在；查询 / 决定未知争议号；向未知设备（无任何读数）提交策略；查询未知交接单号凭证 |
+| 409    | 同事件号提交不同内容；更正已撤销读数；争议目标已撤销；同争议号异内容；对终态争议发反向决定；同批次号异内容；批次中任一读数与库中同号异内容（整批拒绝）；同策略号异内容；同设备同一生效时间的策略重复；同设备同交接单号使用不同时间窗 |
+| 422    | 无效时间格式、无效温度（非数值 / 无穷 / 超范围）、非法事件号；争议原因缺失 / 空白；`correct` 缺目标值或 `revoke` 带目标值；批内事件号重复、批次读数列表为空、非法批次号；非法策略号 / 生效时间 / 策略阈值；交接凭证起止时间非法或结束不晚于开始、非法交接单号 |
 
 错误响应体均含 `detail` 字段说明原因。
 
@@ -546,10 +675,10 @@ pytest -q
 
 ```
 app/
-  main.py       # FastAPI 路由、事务内重算区间、批次提交、争议工作流、温度上限策略、错误处理
-  intervals.py  # 区间计算（单上限 / 按策略逐读数上限）与差异比对（纯函数）
-  models.py     # 请求/响应模型与输入校验（含批次、争议申请 / 决定、策略模型）
-  db.py         # SQLite 连接、建表（读数 / 争议 / 批次 / 策略）与旧库 revision 增量迁移
+  main.py       # FastAPI 路由、事务内重算区间、批次提交、争议工作流、温度上限策略、交接温控凭证、错误处理
+  intervals.py  # 区间计算（单上限 / 按策略逐读数上限）与差异比对、凭证证据冻结（纯函数）
+  models.py     # 请求/响应模型与输入校验（含批次、争议申请 / 决定、策略、交接凭证模型）
+  db.py         # SQLite 连接、建表（读数 / 争议 / 批次 / 策略 / 交接凭证）与旧库 revision 增量迁移
   config.py     # 环境变量配置
   util.py       # 时间规范化（UTC、固定宽度，保证可排序）
 tests/
@@ -557,5 +686,6 @@ tests/
   test_batches.py   # 离线网关成批上报测试（整批事务、逐条状态、一次性差异、重试回执）
   test_disputes.py  # 争议工作流测试（冻结、批准 / 驳回、过期、幂等、迁移）
   test_policies.py  # 温度上限策略测试（回溯重算、多策略时序、幂等、冲突、错误、隔离）
+  test_handover_credentials.py  # 交接温控凭证测试（左闭右开窗、策略适用、重试 / 冲突、冻结性、校验、隔离）
 Dockerfile / docker-compose.yml / requirements*.txt
 ```

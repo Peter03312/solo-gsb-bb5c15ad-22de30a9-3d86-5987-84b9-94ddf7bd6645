@@ -1,6 +1,6 @@
 """请求 / 响应数据模型与输入校验。"""
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -341,3 +341,78 @@ class LimitPolicyListResponse(BaseModel):
     policies: List[LimitPolicyOut] = Field(
         description="该设备全部温度上限策略，按生效时间、策略号排序"
     )
+
+
+class HandoverCredentialIn(BaseModel):
+    """冷链交接温控凭证请求体：设备号在路径中，交接单号 + 左闭右开采样时间窗。
+
+    时间窗 [window_start, window_end) 按采样时间过滤当时未撤销读数；
+    结束时间必须严格晚于开始时间（UTC 归一化后比较，支持等价时区表示）。
+    """
+
+    handover_no: str = Field(
+        description="设备内唯一交接单号（字母 / 数字 / `.` `_` `-`，≤ 64 字符）",
+        pattern=EVENT_NO_PATTERN,
+    )
+    window_start: datetime = Field(description="采样时间窗起点（含）")
+    window_end: datetime = Field(description="采样时间窗终点（不含，必须晚于起点）")
+
+    @field_validator("handover_no", mode="before")
+    @classmethod
+    def coerce_handover_no(cls, v):
+        return _coerce_no(v)
+
+    @model_validator(mode="after")
+    def window_end_after_start(self):
+        start = self.window_start
+        end = self.window_end
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if end <= start:
+            raise ValueError(
+                "window_end must be strictly later than window_start "
+                "(the sampling window is [start, end))"
+            )
+        return self
+
+
+class CredentialEntry(BaseModel):
+    """凭证内一条读数的冻结证据。"""
+
+    event_no: str
+    sampled_at: str
+    temperature: float
+    policy_no: Optional[str] = Field(
+        description="该时刻适用的温度上限策略号；无策略覆盖时为 null"
+    )
+    limit: float = Field(description="该时刻适用的温度上限（无策略时为全局上限）")
+    exceeds_limit: bool = Field(
+        description="是否严格超限：温度严格大于适用上限（等于上限不算）"
+    )
+
+
+class HandoverCredentialOut(BaseModel):
+    """冷链交接温控凭证（首次生成后整体冻结，后续数据变化不改动）。"""
+
+    device_id: str
+    handover_no: str
+    window_start: str = Field(description="规范化（UTC）后的时间窗起点（含）")
+    window_end: str = Field(description="规范化（UTC）后的时间窗终点（不含）")
+    limit: float = Field(
+        description="全局默认上限（未被策略覆盖的读数按它判定，随凭证冻结）"
+    )
+    entries: List[CredentialEntry] = Field(
+        description="窗内当时未撤销读数，按采样时间、事件号排序的逐条证据"
+    )
+    reading_count: int = Field(description="窗内读数数（空窗为 0）")
+    exceed_count: int = Field(description="窗内严格超限读数条数")
+    max_temperature: Optional[float] = Field(
+        description="窗内最高温度；空窗为 null"
+    )
+    created_at: str = Field(description="凭证首次生成时间；重试原样返回首次凭证")
+
+
+class HandoverCredentialResponse(BaseModel):
+    credential: HandoverCredentialOut
