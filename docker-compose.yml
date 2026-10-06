@@ -1,0 +1,15 @@
+services:
+  coldchain:
+    build: .
+    container_name: coldchain-service
+    ports:
+      - "8000:8000"
+    environment:
+      TEMP_LIMIT: "8.0"            # 超温上限（°C），可按需修改
+      DB_PATH: /data/coldchain.db  # 容器内数据库文件路径
+    volumes:
+      - coldchain-data:/data       # 持久化 SQLite 数据
+    restart: unless-stopped
+
+volumes:
+  coldchain-data:
